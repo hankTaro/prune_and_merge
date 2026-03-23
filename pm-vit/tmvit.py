@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import logging
 from functools import partial
-from timm.models.layers import DropPath, PatchEmbed, trunc_normal_, lecun_normal_
+from timm.layers import DropPath, PatchEmbed, trunc_normal_, lecun_normal_
 from timm.models.vision_transformer import _cfg, checkpoint_filter_fn, _load_weights
-from timm.models.registry import register_model
-from timm.models.helpers import build_model_with_cfg, load_pretrained
+from timm.models import register_model
+from timm.models import build_model_with_cfg, load_pretrained
 
 _logger = logging.getLogger(__name__)
 
@@ -430,10 +430,8 @@ def _create_vision_transformer(variant, pretrained=False, default_cfg=None, **kw
     model = build_model_with_cfg(
         VisionTransformer, variant, pretrained,
         # pretrained_cfg=default_cfg,
-        default_cfg=default_cfg,
+        pretrained_cfg=default_cfg,
         representation_size=repr_size,
-        pretrained_filter_fn=checkpoint_filter_fn,
-        pretrained_custom_load='npz' in default_cfg['url'],
         **kwargs)
     return model
 
