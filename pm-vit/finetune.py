@@ -111,7 +111,7 @@ def main(args):
     print(f"Creating model: {args.model}")
     model = create_model(
         args.model,
-        pretrained=True,
+        pretrained=False,
         num_classes=args.nb_classes,
         channels=channels,
         drop_rate=args.drop,
@@ -157,10 +157,10 @@ def main(args):
 
     # model_without_ddp.set_impact_cal()
 
-    if args.pretrain is not '':
+    if args.pretrain != '':
         # checkpoint = torch.load(args.pretrain, map_location='cpu')
         model_without_ddp.load_pretrained(args.pretrain)
-    elif args.resume is not '':
+    elif args.resume != '':
         model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
     else:
         print('None checkpoint to load!')

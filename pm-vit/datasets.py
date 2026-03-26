@@ -3,6 +3,9 @@
 import os
 import json
 
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate truncated images from interrupted downloads
+
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import ImageFolder, default_loader
 

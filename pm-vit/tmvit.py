@@ -425,11 +425,11 @@ def _create_vision_transformer(variant, pretrained=False, default_cfg=None, **kw
         _logger.warning("Removing representation layer for fine-tuning.")
         repr_size = None
 
-    # kwargs.pop('pretrained_cfg')
+    # Pop pretrained_cfg from kwargs if timm's factory already injected it, to avoid duplicate kwarg
+    kwargs.pop('pretrained_cfg', None)
 
     model = build_model_with_cfg(
         VisionTransformer, variant, pretrained,
-        # pretrained_cfg=default_cfg,
         pretrained_cfg=default_cfg,
         representation_size=repr_size,
         **kwargs)

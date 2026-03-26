@@ -1,0 +1,40 @@
+# 資料集
+imagenette2/
+imagenette2.tgz
+imagenet/
+ADE20K/
+ADEChallengeData2016.zip
+data/
+
+# 模型權重與 Checkpoint
+*.pth
+*.npz
+*.bin
+output/
+checkpoints/
+
+# Python 快取
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# 虛擬環境
+venv/
+env/
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# 測試與暫存
+test_model.py
+*.log
+*.tmp
+
+# 系統檔案
+.DS_Store
+Thumbs.db
