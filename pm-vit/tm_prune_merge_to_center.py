@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 # from model import VisionTransformer, SelfAttention
-from tmvit import VisionTransformer, Attention
+from tmvit import VisionTransformer, Attention, RecoverMLP
 # from prune_by_layer import get_new_attn, get_new_out
 
 # merge_list = [2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -212,6 +212,10 @@ def get_merge_matrix(model, masks, scores, center_list, merge_list, mode='attn')
             recover_matrix = torch.linalg.pinv(matrix)
             # print(recover_matrix[:, :2])
             module.recover_matrix = nn.Parameter(recover_matrix)
+            # update recover_mlp to match the new pruned dimensions
+            n_pruned = recover_matrix.shape[1]  # channel after merge
+            n_full = recover_matrix.shape[0]    # num_patches + num_tokens
+            module.recover_mlp = RecoverMLP(n_pruned=n_pruned, n_full=n_full, hidden_ratio=2.0)
             # update stage
             if stage < len(merge_list) - 1:
                 stage += 1

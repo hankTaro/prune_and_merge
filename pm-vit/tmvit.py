@@ -91,6 +91,29 @@ class Mlp(nn.Module):
         return flops
 
 
+class RecoverMLP(nn.Module):
+    """
+    用兩層 MLP 將剪枝後的 Token 序列 (B, N_pruned, dim) 映射回原始長度 (B, N_full, dim)。
+    作用維度為 Token 數量維（N_pruned -> N_full），提供比線性矩陣更強的表達能力。
+    """
+    def __init__(self, n_pruned: int, n_full: int, hidden_ratio: float = 2.0):
+        super().__init__()
+        hidden = int(n_pruned * hidden_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(n_pruned, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, n_full),
+        )
+        nn.init.zeros_(self.net[2].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N_pruned, dim)
+        x = x.transpose(1, 2)   # -> (B, dim, N_pruned)
+        x = self.net(x)          # -> (B, dim, N_full)
+        x = x.transpose(1, 2)   # -> (B, N_full, dim)
+        return x
+
+
 class Attention(nn.Module):
     def __init__(self, dim, num_patches, num_tokens=1, num_heads=8, channel=None, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -111,7 +134,11 @@ class Attention(nn.Module):
             self.channel = channel
 
         self.merge_matrix = nn.Parameter(torch.eye(self.channel, num_patches + num_tokens))
-        self.recover_matrix = nn.Parameter(torch.eye(num_patches + num_tokens, self.channel))
+        self.recover_mlp = RecoverMLP(
+            n_pruned=self.channel,
+            n_full=num_patches + num_tokens,
+            hidden_ratio=2.0
+        )
         # self.token_split = nn.Parameter(torch.range(1, self.channel + 1, dtype=int), requires_grad=False)
         self.token_mask = nn.Parameter(torch.ones(num_patches + num_tokens), requires_grad=False)
         self.bias = nn.Parameter(torch.ones(self.channel), requires_grad=False)
@@ -218,7 +245,7 @@ class Block(nn.Module):
         if not self.merge:
             del self.attn.token_mask
             del self.attn.merge_matrix
-            del self.attn.recover_matrix
+            del self.attn.recover_mlp
             self.attn.bias = None
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
@@ -239,9 +266,9 @@ class Block(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         # print('x_mlp:', x.sum(dim=-1))
 
-        # token recover
+        # token recover via MLP
         if self.merge:
-            x = torch.tensordot(self.attn.recover_matrix, x, dims=([1], [1])).permute(1, 0, 2)
+            x = self.attn.recover_mlp(x)
             # add the shortcut feature
             x = x + x_res
             # assert 0
