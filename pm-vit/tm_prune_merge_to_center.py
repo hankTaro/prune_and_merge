@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 # from model import VisionTransformer, SelfAttention
-from tmvit import VisionTransformer, Attention, RecoverMLP
+from tmvit import VisionTransformer, Attention, RecoverMLP, AdaptiveThresholdGate
 # from prune_by_layer import get_new_attn, get_new_out
 
 # merge_list = [2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -210,12 +210,12 @@ def get_merge_matrix(model, masks, scores, center_list, merge_list, mode='attn')
             module.merge_matrix = nn.Parameter(matrix)
             # get recover matrix
             recover_matrix = torch.linalg.pinv(matrix)
-            # print(recover_matrix[:, :2])
             module.recover_matrix = nn.Parameter(recover_matrix)
-            # update recover_mlp to match the new pruned dimensions
-            n_pruned = recover_matrix.shape[1]  # channel after merge
-            n_full = recover_matrix.shape[0]    # num_patches + num_tokens
-            module.recover_mlp = RecoverMLP(n_pruned=n_pruned, n_full=n_full, hidden_ratio=2.0)
+            # 同步更新 recover_mlp（若啟用 MLP 模式）
+            if hasattr(module, 'recover_mlp'):
+                n_pruned = recover_matrix.shape[1]
+                n_full = recover_matrix.shape[0]
+                module.recover_mlp = RecoverMLP(n_pruned=n_pruned, n_full=n_full, hidden_ratio=2.0)
             # update stage
             if stage < len(merge_list) - 1:
                 stage += 1
@@ -275,21 +275,37 @@ def tm_prune(model, num_prune, num_keep, merge_list, mode='attn'):
         # global
         num_prune = num_prune * len(merge_list)
         num_keep = num_keep * len(merge_list)
-        prune_thr = np.sort(np.hstack(layer_ranks))[num_prune]
+        base_prune_thr = np.sort(np.hstack(layer_ranks))[num_prune]
         keep_thr = np.sort(np.hstack(layer_ranks))[-num_keep]
-        masks = [layer_rank >= prune_thr for layer_rank in layer_ranks]
-        # local
-        # prune_thr = np.sort(layer_ranks[merge_list], axis=-1)[:, num_prune]
-        # keep_thr = np.sort(layer_ranks[merge_list], axis=-1)[:, -num_keep]
-        # # print(smallest)
-        # masks = [layer_rank >= thr for layer_rank, thr in zip(layer_ranks[merge_list], prune_thr)]
 
+        # 讀取 gate cache（若模型有 AdaptiveThresholdGate）
+        gate_cache = None
+        for name, mod in model.named_modules():
+            if hasattr(mod, 'threshold_gate') and mod.threshold_gate is not None:
+                gate_cache = mod.threshold_gate._gate_cache.cpu().numpy()
+                break
+
+        masks = []
         scores = []
-        for layer_rank, mask in zip(layer_ranks, masks):
-            scores.append(layer_rank * mask)
-        # print(scores)
-        # center_list = [(np.where(score >= thr)[0]) for score, thr in zip(scores, keep_thr)]
-        center_list = [(np.where(score >= keep_thr)[0]) for score in scores]
+        center_list = []
+        for idx, (layer_rank, layer) in enumerate(zip(layer_ranks, merge_list)):
+            gate_val = float(gate_cache[layer]) if gate_cache is not None else 0.5
+            # gate 高 → 保守 → tau_prune 降「低」（少剪 Token）
+            # gate=1 時最保守，tau_prune 為 base 的 0.25 倍
+            # gate=0 時最激進，tau_prune 等同 base
+            tau_prune = base_prune_thr * (1.0 - gate_val * 0.75)
+            print(f"Block {layer}: gate={gate_val:.4f}, tau_prune={tau_prune:.6f}")  # 層級分化驗證
+            
+            # 1. 計算該層的 mask（保留哪些 token）
+            layer_mask = layer_rank >= tau_prune
+            masks.append(layer_mask)
+            
+            # 2. 計算該層的 score（被剪掉的 token 分數歸零）
+            layer_score = layer_rank * layer_mask
+            scores.append(layer_score)
+            
+            # 3. 計算 center（保留超過 keep_thr 的 token）
+            center_list.append(np.where(layer_score >= keep_thr)[0])  # ← keep_thr 固定
     elif mode == 'clus':
         masks = np.asarray(masks)
         # recovers = np.asarray(recovers)

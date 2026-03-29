@@ -114,8 +114,47 @@ class RecoverMLP(nn.Module):
         return x
 
 
+class AdaptiveThresholdGate(nn.Module):
+    """
+    Per-layer learnable Sigmoid gate:
+      gate = σ(w_var * Var(scores) + w_ent * Entropy(scores) + bias)
+    Gate output ∈ (0, 1):
+      → 接近1：Token 多樣，保守合併（軟化剖枝）
+      → 接近0：Token 相似，激進合併（加強剖枝）
+    """
+    def __init__(self, num_layers: int = 12):
+        super().__init__()
+        self.w_var = nn.Parameter(torch.zeros(num_layers))
+        self.w_ent = nn.Parameter(torch.zeros(num_layers))
+        self.bias  = nn.Parameter(torch.full((num_layers,), -2.2))
+        # 給 tm_prune 讀取的 cache（不參與梯度）
+        self.register_buffer('_gate_cache', torch.ones(num_layers) * 0.5)
+
+    def forward(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        """
+        x: (B, N, dim) 在 merge 前的 Token 序列
+        回傳 gate_scale (scalar tensor)
+        """
+        # Token 重要性代理：去掉 cls token 後各 Token 的 L2 norm 平均
+        scores = x.detach().norm(dim=-1).mean(dim=0)[1:]  # (N-1,)
+        s = scores - scores.min()
+        s = s / (s.sum() + 1e-8)
+        var = s.var()
+        entropy = -(s * torch.log(s + 1e-8)).sum()
+        gate = torch.sigmoid(
+            self.w_var[layer_idx] * var +
+            self.w_ent[layer_idx] * entropy +
+            self.bias[layer_idx]
+        )
+        # 更新 cache（供 tm_prune 讀取）
+        with torch.no_grad():
+            self._gate_cache[layer_idx] = gate.detach()
+        return gate
+
+
 class Attention(nn.Module):
-    def __init__(self, dim, num_patches, num_tokens=1, num_heads=8, channel=None, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_patches, num_tokens=1, num_heads=8, channel=None, qkv_bias=False,
+                 attn_drop=0., proj_drop=0., use_recover_mlp=True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = 64
@@ -123,7 +162,6 @@ class Attention(nn.Module):
         self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, (num_heads * self.head_dim) * 3, bias=qkv_bias)
-        # print(self.qkv.weight.data.shape)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(num_heads * self.head_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -134,15 +172,17 @@ class Attention(nn.Module):
             self.channel = channel
 
         self.merge_matrix = nn.Parameter(torch.eye(self.channel, num_patches + num_tokens))
-        self.recover_mlp = RecoverMLP(
-            n_pruned=self.channel,
-            n_full=num_patches + num_tokens,
-            hidden_ratio=2.0
-        )
-        # self.token_split = nn.Parameter(torch.range(1, self.channel + 1, dtype=int), requires_grad=False)
+        # 消融實驗支持：根據 flag 決定使用 recover_mlp 或原始線性 recover_matrix
+        if use_recover_mlp:
+            self.recover_mlp = RecoverMLP(
+                n_pruned=self.channel,
+                n_full=num_patches + num_tokens,
+                hidden_ratio=2.0
+            )
+        else:
+            self.recover_matrix = nn.Parameter(torch.eye(num_patches + num_tokens, self.channel))
         self.token_mask = nn.Parameter(torch.ones(num_patches + num_tokens), requires_grad=False)
         self.bias = nn.Parameter(torch.ones(self.channel), requires_grad=False)
-        # self.bias = None
         self.attn = None
         self.seq_ranks = None
         self.cnt = 0
@@ -229,14 +269,17 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, num_patches, num_tokens=1, mlp_ratio=4., channel=None, qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, merge=False, recover=False):
+    def __init__(self, dim, num_heads, num_patches, num_tokens=1, mlp_ratio=4., channel=None, qkv_bias=False,
+                 drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 merge=False, recover=False, layer_idx=0, threshold_gate=None, use_recover_mlp=True):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.channel = channel
+        self.layer_idx = layer_idx
+        self.threshold_gate = threshold_gate
         self.attn = Attention(dim, num_patches, num_heads=num_heads, num_tokens=num_tokens,
-                              channel=channel, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+                              channel=channel, qkv_bias=qkv_bias, attn_drop=attn_drop,
+                              proj_drop=drop, use_recover_mlp=use_recover_mlp)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -245,33 +288,36 @@ class Block(nn.Module):
         if not self.merge:
             del self.attn.token_mask
             del self.attn.merge_matrix
-            del self.attn.recover_mlp
+            if hasattr(self.attn, 'recover_mlp'):
+                del self.attn.recover_mlp
+            if hasattr(self.attn, 'recover_matrix'):
+                del self.attn.recover_matrix
             self.attn.bias = None
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, compute_taylor_attn=False):
         # merge token
         if self.merge:
-            # get the redundant for shortcut
-            # this step is not necessary
-            # x_keep = torch.tensordot(torch.diag(self.attn.token_mask), x, dims=([1], [1])).permute(1, 0, 2)
             x_res = torch.tensordot(torch.diag(1 - self.attn.token_mask), x, dims=([1], [1])).permute(1, 0, 2)
-            # print('x_res: ', x_res.sum(dim=-1))
-            #
-            x = torch.tensordot(self.attn.merge_matrix, x, dims=([1], [1])).permute(1, 0, 2)
+            # gate 動態縮放 merge_matrix
+            if self.threshold_gate is not None:
+                gate_scale = self.threshold_gate(x, self.layer_idx)
+                scaled_merge = gate_scale * self.attn.merge_matrix
+            else:
+                scaled_merge = self.attn.merge_matrix
+            x = torch.tensordot(scaled_merge, x, dims=([1], [1])).permute(1, 0, 2)
 
         # original
         x = x + self.drop_path(self.attn(self.norm1(x), compute_taylor_attn))
-        # print('x msa:', x.sum(dim=-1))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-        # print('x_mlp:', x.sum(dim=-1))
 
-        # token recover via MLP
+        # token recover
         if self.merge:
-            x = self.attn.recover_mlp(x)
-            # add the shortcut feature
+            if hasattr(self.attn, 'recover_mlp'):
+                x = self.attn.recover_mlp(x)
+            else:
+                x = torch.tensordot(self.attn.recover_matrix, x, dims=([1], [1])).permute(1, 0, 2)
             x = x + x_res
-            # assert 0
         return x
 
     def flops(self):
@@ -291,10 +337,12 @@ class VisionTransformer(nn.Module):
         - https://arxiv.org/abs/2012.12877
     """
 
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, embed_dims=None, depth=12,
-                 num_heads=12, mlp_ratio=4., channels=None, qkv_bias=True, representation_size=None, distilled=False,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, merge_list=[], recover_list=[], weight_init=''):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768,
+                 embed_dims=None, depth=12, num_heads=12, mlp_ratio=4., channels=None, qkv_bias=True,
+                 representation_size=None, distilled=False, drop_rate=0., attn_drop_rate=0.,
+                 drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None, act_layer=None,
+                 merge_list=[], recover_list=[], weight_init='',
+                 use_recover_mlp=True, use_adaptive_gate=False):
         """
         Args:
             img_size (int, tuple): input image size
@@ -339,18 +387,27 @@ class VisionTransformer(nn.Module):
         assert len(channels) == depth
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+
+        # 建立動態門控（消融實驗 flag）
+        if use_adaptive_gate:
+            self.threshold_gate = AdaptiveThresholdGate(num_layers=depth)
+        else:
+            self.threshold_gate = None
+
         self.blocks = nn.ModuleList()
         for i in range(depth):
-
             merge = True if i in merge_list else False
             recover = True if i in recover_list else False
-
+            gate_for_block = self.threshold_gate if (merge and use_adaptive_gate) else None
             self.blocks.append(
                 Block(
                     dim=embed_dim, num_heads=num_heads, num_patches=self.num_patches, num_tokens=self.num_tokens,
                     mlp_ratio=mlp_ratio, channel=channels[i], qkv_bias=qkv_bias, attn_drop=attn_drop_rate,
-                    drop=drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer, merge=merge,
-                    recover=recover)
+                    drop=drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
+                    merge=merge, recover=recover,
+                    layer_idx=i, threshold_gate=gate_for_block,
+                    use_recover_mlp=use_recover_mlp,
+                )
             )
 
         self.norm = norm_layer(embed_dim)

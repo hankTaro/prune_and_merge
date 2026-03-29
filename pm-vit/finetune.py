@@ -119,6 +119,8 @@ def main(args):
         drop_block_rate=None,
         merge_list=args.merge_list,
         recover_list=args.recover_list,
+        use_recover_mlp=args.use_recover_mlp,
+        use_adaptive_gate=args.use_adaptive_gate,
     )
 
     model.to(device)
@@ -300,11 +302,18 @@ def main(args):
         print('param: ', model_without_ddp.blocks[0].attn.qkv.weight.requires_grad)
     if args.freeze_matrix:
         for n, p in model_without_ddp.named_parameters():
-            if 'recover_matrix' in n or 'merge_matrix' in n:
+            if 'recover_matrix' in n or 'merge_matrix' in n or 'recover_mlp' in n:
                 p.requires_grad = False
-        print('matrix: ', model_without_ddp.blocks[0].attn.recover_matrix.requires_grad)
+        print('matrix frozen')
 
     for epoch in range(args.final_finetune):
+        # 前 40 輪可訓練 gate，後 20 輪凍結
+        freeze_epoch = max(0, args.final_finetune - 20)
+        if epoch == freeze_epoch and args.use_adaptive_gate:
+            for n, p in model_without_ddp.named_parameters():
+                if 'threshold_gate' in n:
+                    p.requires_grad = False
+            print(f'[Epoch {epoch}] AdaptiveThresholdGate parameters frozen.')
 
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)

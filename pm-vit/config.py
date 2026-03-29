@@ -424,6 +424,13 @@ def get_prune_args():
     parser.add_argument("--recover_list", nargs='+', type=int, default=[11])
     parser.add_argument("--final_finetune", type=int, default=100)
     parser.add_argument("--finetune_nums", type=int, default=1, help="number of training/fine-tuning steps")
+    # 消融實驗 flags
+    parser.add_argument("--use_recover_mlp", action='store_true', default=True,
+                        help="Use 2-layer MLP for token recovery (ablation group 2 & 3)")
+    parser.add_argument("--no_recover_mlp", action='store_false', dest='use_recover_mlp',
+                        help="Use original linear recover_matrix (ablation group 0 & 1)")
+    parser.add_argument("--use_adaptive_gate", action='store_true', default=False,
+                        help="Enable AdaptiveThresholdGate for dynamic pruning (ablation group 1 & 3)")
 
     # Dataset parameters
     parser.add_argument('--data-path', default='/data/imagenet/', type=str,
