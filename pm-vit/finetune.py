@@ -94,7 +94,7 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
 
         if 'channels' in checkpoint:
             channels = checkpoint['channels']
@@ -278,7 +278,7 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.teacher_path, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.teacher_path, map_location='cpu')
+            checkpoint = torch.load(args.teacher_path, map_location='cpu', weights_only=False)
         teacher_model.load_state_dict(checkpoint['model'], strict=False)
         teacher_model.to(device)
         teacher_model.eval()
