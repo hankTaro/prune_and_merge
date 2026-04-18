@@ -215,7 +215,7 @@ def get_merge_matrix(model, masks, scores, center_list, merge_list, mode='attn')
             if hasattr(module, 'recover_mlp'):
                 n_pruned = recover_matrix.shape[1]
                 n_full = recover_matrix.shape[0]
-                module.recover_mlp = RecoverMLP(n_pruned=n_pruned, n_full=n_full, hidden_ratio=2.0)
+                module.recover_mlp = RecoverMLP(n_pruned=n_pruned, n_full=n_full, hidden_ratio=2.0, recover_matrix=recover_matrix)
             # update stage
             if stage < len(merge_list) - 1:
                 stage += 1
@@ -305,7 +305,11 @@ def tm_prune(model, num_prune, num_keep, merge_list, mode='attn'):
             scores.append(layer_score)
             
             # 3. 計算 center（保留超過 keep_thr 的 token）
-            center_list.append(np.where(layer_score >= keep_thr)[0])  # ← keep_thr 固定
+            centers = np.where(layer_score >= keep_thr)[0]
+            if len(centers) == 0:
+                # 安全機制：若該層沒有 Token 超過全局 keep_thr，強制保留該層分數最高的一個，以免引發 IndexError
+                centers = np.array([np.argmax(layer_score)])
+            center_list.append(centers)  # ← keep_thr 固定
     elif mode == 'clus':
         masks = np.asarray(masks)
         # recovers = np.asarray(recovers)

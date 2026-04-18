@@ -94,9 +94,9 @@ class Mlp(nn.Module):
 class RecoverMLP(nn.Module):
     """
     用兩層 MLP 將剪枝後的 Token 序列 (B, N_pruned, dim) 映射回原始長度 (B, N_full, dim)。
-    作用維度為 Token 數量維（N_pruned -> N_full），提供比線性矩陣更強的表達能力。
+    加入殘差保底機制：輸出 = 數學線性矩陣還原(保底 52.8%) + MLP_非線性微調(初值為0)
     """
-    def __init__(self, n_pruned: int, n_full: int, hidden_ratio: float = 2.0):
+    def __init__(self, n_pruned: int, n_full: int, hidden_ratio: float = 2.0, recover_matrix: torch.Tensor = None):
         super().__init__()
         hidden = int(n_pruned * hidden_ratio)
         self.net = nn.Sequential(
@@ -104,14 +104,40 @@ class RecoverMLP(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, n_full),
         )
+        
+        # 殘差層的核心技巧：強制讓 MLP 最終層輸出 0
+        nn.init.zeros_(self.net[2].weight)
         nn.init.zeros_(self.net[2].bias)
+        
+        # 保存原有的線性還原矩陣做為 Shortcut
+        # 必須註冊為 nn.Parameter 即使初始為 None，否則 load_state_dict 會因為 Unexpected key 失敗
+        self.recover_matrix = nn.Parameter(torch.zeros(n_full, n_pruned))
+        if recover_matrix is not None:
+            with torch.no_grad():
+                self.recover_matrix.copy_(recover_matrix)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N_pruned, dim)
-        x = x.transpose(1, 2)   # -> (B, dim, N_pruned)
-        x = self.net(x)          # -> (B, dim, N_full)
-        x = x.transpose(1, 2)   # -> (B, N_full, dim)
-        return x
+        # MLP 前向傳播
+        x_transpose = x.transpose(1, 2)
+        mlp_out = self.net(x_transpose).transpose(1, 2)
+        
+        # 殘差相加 (使用註冊的線性矩陣)
+        linear_out = torch.tensordot(self.recover_matrix, x, dims=([1], [1])).permute(1, 0, 2)
+        return mlp_out + linear_out
+
+    def flops(self, in_dim: int) -> int:
+        n_pruned = self.net[0].in_features
+        hidden = self.net[0].out_features
+        n_full = self.net[2].out_features
+        
+        flops = 0
+        # MLP Layer 1
+        flops += n_pruned * hidden * in_dim
+        # MLP Layer 2 
+        flops += hidden * n_full * in_dim
+        # Shortcut matrix
+        flops += n_pruned * n_full * in_dim
+        return flops
 
 
 class AdaptiveThresholdGate(nn.Module):
@@ -151,6 +177,14 @@ class AdaptiveThresholdGate(nn.Module):
             self._gate_cache[layer_idx] = gate.detach()
         return gate
 
+    def flops(self, in_dim: int, n_tokens: int) -> int:
+        flops = 0
+        # L2 norm across in_dim for each token
+        flops += n_tokens * in_dim
+        # Variance and Entropy estimates
+        flops += 4 * n_tokens
+        return flops
+
 
 class Attention(nn.Module):
     def __init__(self, dim, num_patches, num_tokens=1, num_heads=8, channel=None, qkv_bias=False,
@@ -177,7 +211,8 @@ class Attention(nn.Module):
             self.recover_mlp = RecoverMLP(
                 n_pruned=self.channel,
                 n_full=num_patches + num_tokens,
-                hidden_ratio=2.0
+                hidden_ratio=2.0,
+                recover_matrix=torch.eye(num_patches + num_tokens, self.channel)
             )
         else:
             self.recover_matrix = nn.Parameter(torch.eye(num_patches + num_tokens, self.channel))
@@ -253,19 +288,33 @@ class Attention(nn.Module):
         self.cnt = 0
 
     def flops(self):
-        flops = 0
+        flops_core = 0
         total_dim = self.head_dim * self.num_heads
         # q.k.v dot x
-        flops += 3 * self.channel * total_dim * self.in_dim
+        flops_core += 3 * self.channel * total_dim * self.in_dim
         # attn = q matmul k.transpose
-        flops += self.channel * total_dim * self.channel
+        flops_core += self.channel * total_dim * self.channel
         # softmax
-        flops += self.num_heads * self.channel * self.channel
+        flops_core += self.num_heads * self.channel * self.channel
         # out = attn matmul v
-        flops += self.channel * total_dim * self.channel
+        flops_core += self.channel * total_dim * self.channel
         # self.out dot out
-        flops += self.channel * total_dim * self.in_dim
-        return flops
+        flops_core += self.channel * total_dim * self.in_dim
+        
+        flops_pm = 0
+        # Pruning & Merge Matrix
+        if hasattr(self, 'merge_matrix'):
+            # merge_matrix shape is (channel, N_full), tensordot across in_dim
+            flops_pm += self.merge_matrix.size(0) * self.merge_matrix.size(1) * self.in_dim
+            
+        # Recover mechanism
+        if hasattr(self, 'recover_mlp'):
+            flops_pm += self.recover_mlp.flops(self.in_dim)
+        elif hasattr(self, 'recover_matrix'):
+            # recover_matrix shape is (N_full, channel)
+            flops_pm += self.recover_matrix.size(0) * self.recover_matrix.size(1) * self.in_dim
+
+        return flops_core, flops_pm
 
 
 class Block(nn.Module):
@@ -299,13 +348,12 @@ class Block(nn.Module):
         # merge token
         if self.merge:
             x_res = torch.tensordot(torch.diag(1 - self.attn.token_mask), x, dims=([1], [1])).permute(1, 0, 2)
-            # gate 動態縮放 merge_matrix
+            
+            # 更新 gate_cache (維持 threshold gate 正常計算，但不扭曲 merge_matrix)
             if self.threshold_gate is not None:
-                gate_scale = self.threshold_gate(x, self.layer_idx)
-                scaled_merge = gate_scale * self.attn.merge_matrix
-            else:
-                scaled_merge = self.attn.merge_matrix
-            x = torch.tensordot(scaled_merge, x, dims=([1], [1])).permute(1, 0, 2)
+                _ = self.threshold_gate(x, self.layer_idx)
+                
+            x = torch.tensordot(self.attn.merge_matrix, x, dims=([1], [1])).permute(1, 0, 2)
 
         # original
         x = x + self.drop_path(self.attn(self.norm1(x), compute_taylor_attn))
@@ -321,10 +369,18 @@ class Block(nn.Module):
         return x
 
     def flops(self):
-        flops = 0
-        flops += self.attn.flops()
-        flops += self.mlp.flops(self.channel)
-        return flops, self.attn.flops()
+        flops_attn_core, flops_pm = self.attn.flops()
+        flops_mlp_core = self.mlp.flops(self.channel)
+        
+        flops_gate = 0
+        # Add Adaptive Gate FLOPs
+        if self.threshold_gate is not None:
+            n_tokens = self.attn.merge_matrix.size(1) if hasattr(self.attn, 'merge_matrix') else self.channel
+            flops_gate = self.threshold_gate.flops(self.attn.in_dim, n_tokens)
+            
+        total_flops = flops_attn_core + flops_pm + flops_mlp_core + flops_gate
+        # To maintain compatibility with VisionTransformer aggregate loop, return full tuple
+        return total_flops, flops_attn_core, flops_pm, flops_mlp_core, flops_gate
 
 
 class VisionTransformer(nn.Module):
@@ -484,13 +540,40 @@ class VisionTransformer(nn.Module):
         num_class, _ = self.head.weight.data.shape
         # flop_embedding = self.num_patches * in_dim * embed_dim * (fw * fh)
         flop_classify = self.num_patches * num_class * embed_dim
-        # print(flop_embedding, flop_classify)
-        flops = flop_classify #+ flop_embedding
-        attn_f = 0
+        
+        total_flops = flop_classify
+        sum_attn = 0
+        sum_pm = 0
+        sum_mlp = 0
+        sum_gate = 0
+        
         for layer in self.blocks:
-            flops += layer.flops()[0]
-            attn_f += layer.flops()[1]
-        return flops, attn_f
+            try:
+                l_total, l_attn, l_pm, l_mlp, l_gate = layer.flops()
+                total_flops += l_total
+                sum_attn += l_attn
+                sum_pm += l_pm
+                sum_mlp += l_mlp
+                sum_gate += l_gate
+            except ValueError:
+                # fallback just in case
+                ret = layer.flops()
+                total_flops += ret[0]
+                sum_attn += ret[1]
+
+        print(f"\n=========================================")
+        print(f"          PM-ViT FLOPs 詳細拆解           ")
+        print(f"=========================================")
+        print(f" 1. 分類頭 (Classifier)  : {flop_classify / 1e6:>8.2f} MFLOPs")
+        print(f" 2. 注意力核心 (Attn Core) : {sum_attn / 1e6:>8.2f} MFLOPs")
+        print(f" 3. 自注意 MLP (Trans MLP) : {sum_mlp / 1e6:>8.2f} MFLOPs")
+        print(f" 4. 剪枝融合與重建 (P&M)   : {sum_pm / 1e6:>8.2f} MFLOPs")
+        print(f" 5. 動態門控 (AdaGate)   : {sum_gate / 1e6:>8.2f} MFLOPs")
+        print(f"-----------------------------------------")
+        print(f" => 總計 (Total FLOPs)   : {total_flops / 1e6:>8.2f} MFLOPs")
+        print(f"=========================================\n")
+
+        return int(total_flops), int(sum_attn)
         # return self.blocks.flops()  + flop_classify
 
 
